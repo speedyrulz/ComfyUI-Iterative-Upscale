@@ -90,15 +90,13 @@ class UnsamplerHookProvider:
 
     def doit(self, model, steps, start_end_at_step, end_end_at_step, cfg, sampler_name,
              scheduler, normalize, positive, negative, schedule_for_iteration):
-        try:
-            hook = None
-            if schedule_for_iteration == "simple":
-                hook = hooks.UnsamplerHook(model, steps, start_end_at_step, end_end_at_step, cfg, sampler_name,
-                                           scheduler, normalize, positive, negative)
+        # The Unsampler code is bundled (noise_nodes.py), so no extra node pack is needed.
+        hook = None
+        if schedule_for_iteration == "simple":
+            hook = hooks.UnsamplerHook(model, steps, start_end_at_step, end_end_at_step, cfg, sampler_name,
+                                       scheduler, normalize, positive, negative)
 
-            return (hook, )
-        except Exception as e:
-            logging.error(f"[Impact Pack] UnsamplerHookProvider: 'ComfyUI Noise' custom node isn't installed. You must install 'BlenderNeko/ComfyUI Noise' extension to use this node.\t{e}")
+        return (hook, )
 
 
 class NoiseInjectionHookProvider:
@@ -121,14 +119,11 @@ class NoiseInjectionHookProvider:
     CATEGORY = "RulZ/Upscale"
 
     def doit(self, schedule_for_iteration, source, seed, start_strength, end_strength):
-        try:
-            hook = None
-            if schedule_for_iteration == "simple":
-                hook = hooks.InjectNoiseHook(source, seed, start_strength, end_strength)
+        hook = None
+        if schedule_for_iteration == "simple":
+            hook = hooks.InjectNoiseHook(source, seed, start_strength, end_strength)
 
-            return (hook, )
-        except Exception as e:
-            logging.error(f"[Impact Pack] NoiseInjectionHookProvider: 'ComfyUI Noise' custom node isn't installed. You must install 'BlenderNeko/ComfyUI Noise' extension to use this node.\t{e}")
+        return (hook, )
 
 
 class DenoiseScheduleHookProvider:
@@ -461,6 +456,13 @@ class TwoSamplersForMaskUpscalerProviderPipe:
         return (upscaler, )
 
 
+def vae_spatial_compression(vae, default=8):
+    try:
+        return int(vae.spacial_compression_decode())
+    except Exception:
+        return default
+
+
 class IterativeLatentUpscale:
     @classmethod
     def INPUT_TYPES(s):
@@ -484,8 +486,18 @@ class IterativeLatentUpscale:
 
     # dim_reduction_factor=8 for SD1/SDXL, used to calculate actual dims from latents based on VAE
     def doit(self, samples, upscale_factor, steps, temp_prefix, upscaler, step_mode="simple", vae_compression=8, unique_id=None):
+        if vae_compression <= 0:
+            # 0 (the widget minimum) used to make every target size 0x0, which ImageScale
+            # ignores, so nothing was upscaled. Read the factor from the VAE instead.
+            vae_compression = vae_spatial_compression(getattr(upscaler, 'vae', None))
+
         h, w = samples['samples'].shape[-2:]
         w, h = w * vae_compression, h * vae_compression
+
+        def snap(size):
+            # The VAE centre-crops pixels to multiples of its factor, cutting off the image
+            # edges at every step; scaling straight to a multiple keeps the whole image.
+            return max(vae_compression, int(size) // vae_compression * vae_compression)
 
         if temp_prefix == "":
             temp_prefix = None
@@ -499,30 +511,31 @@ class IterativeLatentUpscale:
         noise_mask = current_latent.get('noise_mask')
         scale = 1
 
-        for i in range(steps-1):
-            if step_mode == "geometric":
-                scale *= upscale_factor_unit
-            else:  # simple
-                scale += upscale_factor_unit
+        try:
+            for i in range(steps-1):
+                if step_mode == "geometric":
+                    scale *= upscale_factor_unit
+                else:  # simple
+                    scale += upscale_factor_unit
 
-            new_w = w*scale
-            new_h = h*scale
-            core.update_node_status(unique_id, f"{i+1}/{steps} steps | x{scale:.2f}", (i+1)/steps)
-            logging.info(f"IterativeLatentUpscale[{i+1}/{steps}]: {new_w:.1f}x{new_h:.1f} (scale:{scale:.2f}) ")
-            step_info = i, steps
-            current_latent = upscaler.upscale_shape(step_info, current_latent, new_w, new_h, temp_prefix)
-            if noise_mask is not None:
-                current_latent['noise_mask'] = noise_mask
+                new_w = snap(w*scale)
+                new_h = snap(h*scale)
+                core.update_node_status(unique_id, f"{i+1}/{steps} steps | x{scale:.2f}", (i+1)/steps)
+                logging.info(f"IterativeLatentUpscale[{i+1}/{steps}]: {new_w:.1f}x{new_h:.1f} (scale:{scale:.2f}) ")
+                step_info = i, steps
+                current_latent = upscaler.upscale_shape(step_info, current_latent, new_w, new_h, temp_prefix)
+                if noise_mask is not None:
+                    current_latent['noise_mask'] = noise_mask
 
-        if scale < upscale_factor:
-            new_w = w*upscale_factor
-            new_h = h*upscale_factor
+            # The final step always runs, so `steps` passes are made even at upscale_factor 1.
+            new_w = snap(w*upscale_factor)
+            new_h = snap(h*upscale_factor)
             core.update_node_status(unique_id, f"Final step | x{upscale_factor:.2f}", 1.0)
             logging.info(f"IterativeLatentUpscale[Final]: {new_w:.1f}x{new_h:.1f} (scale:{upscale_factor:.2f}) ")
             step_info = steps-1, steps
             current_latent = upscaler.upscale_shape(step_info, current_latent, new_w, new_h, temp_prefix)
-
-        core.update_node_status(unique_id, "", None)
+        finally:
+            core.update_node_status(unique_id, "", None)
 
         return current_latent, upscaler.vae
 
@@ -553,24 +566,34 @@ class IterativeImageUpscale:
         if temp_prefix == "":
             temp_prefix = None
 
-        core.update_node_status(unique_id, "VAEEncode (first)", 0)
-        if upscaler.is_tiled:
-            encoder = nodes.VAEEncodeTiled()
-            if 'overlap' in inspect.signature(encoder.encode).parameters:
-                latent = encoder.encode(vae, pixels, upscaler.tile_size, overlap=upscaler.overlap)[0]
+        # Tiled VAE for the first encode and final decode whenever the upscaler uses it per step
+        # (the tiled sampler always does; the other upscalers when use_tiled_vae is on).
+        use_tile = upscaler.is_tiled or getattr(upscaler, 'use_tiled_vae', False)
+        overlap = core.clamp_overlap(upscaler.tile_size, getattr(upscaler, 'overlap', 64))
+
+        try:
+            core.update_node_status(unique_id, "VAEEncode (first)", 0)
+            if use_tile:
+                encoder = nodes.VAEEncodeTiled()
+                if 'overlap' in inspect.signature(encoder.encode).parameters:
+                    latent = encoder.encode(vae, pixels, upscaler.tile_size, overlap=overlap)[0]
+                else:
+                    latent = encoder.encode(vae, pixels, upscaler.tile_size)[0]
             else:
-                latent = encoder.encode(vae, pixels, upscaler.tile_size)[0]
-        else:
-            latent = nodes.VAEEncode().encode(vae, pixels)[0]
+                latent = nodes.VAEEncode().encode(vae, pixels)[0]
 
-        refined_latent = IterativeLatentUpscale().doit(latent, upscale_factor, steps, temp_prefix, upscaler, step_mode, vae_compression, unique_id)
+            refined_latent = IterativeLatentUpscale().doit(latent, upscale_factor, steps, temp_prefix, upscaler, step_mode, vae_compression, unique_id)
 
-        core.update_node_status(unique_id, "VAEDecode (final)", 1.0)
-        if upscaler.is_tiled:
-            pixels = nodes.VAEDecodeTiled().decode(vae, refined_latent[0], upscaler.tile_size)[0]
-        else:
-            pixels = nodes.VAEDecode().decode(vae, refined_latent[0])[0]
-
-        core.update_node_status(unique_id, "", None)
+            core.update_node_status(unique_id, "VAEDecode (final)", 1.0)
+            if use_tile:
+                decoder = nodes.VAEDecodeTiled()
+                if 'overlap' in inspect.signature(decoder.decode).parameters:
+                    pixels = decoder.decode(vae, refined_latent[0], upscaler.tile_size, overlap=overlap)[0]
+                else:
+                    pixels = decoder.decode(vae, refined_latent[0], upscaler.tile_size)[0]
+            else:
+                pixels = nodes.VAEDecode().decode(vae, refined_latent[0])[0]
+        finally:
+            core.update_node_status(unique_id, "", None)
 
         return (pixels, )

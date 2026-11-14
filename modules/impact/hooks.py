@@ -1,9 +1,37 @@
 import logging
 
+import torch
+
+import comfy.model_management
+import comfy.utils
 import nodes
 
-from . import utils
 from . import noise_nodes
+
+
+def schedule_progress(cur_step, total_step):
+    """0.0 on the first iteration, 1.0 on the last (0.0 when there is only one)."""
+    if total_step > 1:
+        return cur_step / (total_step - 1)
+    return 0.0
+
+
+def inject_noise(samples, strength, source, seed, mask=None):
+    """Add seeded Gaussian noise of the latent's own shape (any channel count or VAE factor)."""
+    latent = samples['samples']
+    device = torch.device("cpu") if source == "CPU" else comfy.model_management.get_torch_device()
+    generator = torch.Generator(device=device).manual_seed(seed)
+    noise = torch.randn(latent.shape, generator=generator, device=device, dtype=torch.float32)
+    noise = noise.to(device=latent.device, dtype=latent.dtype)
+
+    noised = latent + noise * strength
+    if mask is not None:
+        mask = comfy.utils.reshape_mask(mask, noised.shape).to(device=noised.device, dtype=noised.dtype)
+        noised = mask * noised + (1 - mask) * latent
+
+    out = samples.copy()
+    out['samples'] = noised
+    return out
 
 
 class PixelKSampleHook:
@@ -93,7 +121,7 @@ class SimpleCfgScheduleHook(PixelKSampleHook):
         if self.total_step > 1:
             progress = self.cur_step / (self.total_step - 1)
             gap = self.target_cfg - cfg
-            current_cfg = int(cfg + gap * progress)
+            current_cfg = cfg + gap * progress
         else:
             current_cfg = self.target_cfg
 
@@ -147,24 +175,23 @@ class InjectNoiseHook(PixelKSampleHook):
         size = samples['samples'].shape
         seed = cur_step + self.seed + cur_step
 
-        if "BNK_NoisyLatentImage" in nodes.NODE_CLASS_MAPPINGS and "BNK_InjectNoise" in nodes.NODE_CLASS_MAPPINGS:
-            NoisyLatentImage = nodes.NODE_CLASS_MAPPINGS["BNK_NoisyLatentImage"]
-            InjectNoise = nodes.NODE_CLASS_MAPPINGS["BNK_InjectNoise"]
-        else:
-            utils.try_install_custom_node('https://github.com/BlenderNeko/ComfyUI_Noise',
-                                          "To use 'NoiseInjectionHookProvider', 'ComfyUI Noise' extension is required.")
-            raise Exception("'BNK_NoisyLatentImage', 'BNK_InjectNoise' nodes are not installed.")
-
-        noise = NoisyLatentImage().create_noisy_latents(self.source, seed, size[3] * 8, size[2] * 8, size[0])[0]
-
         # inj noise
         mask = None
         if 'noise_mask' in samples:
             mask = samples['noise_mask']
 
-        strength = self.start_strength + (self.end_strength - self.start_strength) * cur_step / self.total_step
-        samples = InjectNoise().inject_noise(samples, strength, noise, mask)[0]
+        strength = self.start_strength + (self.end_strength - self.start_strength) * schedule_progress(cur_step, self.total_step)
         logging.info(f"[Impact Pack] InjectNoiseHook: strength = {strength}")
+
+        mappings = nodes.NODE_CLASS_MAPPINGS
+        if len(size) == 4 and size[1] == 4 and "BNK_NoisyLatentImage" in mappings and "BNK_InjectNoise" in mappings:
+            # 4-channel latents keep using ComfyUI Noise, so results match earlier versions.
+            noise = mappings["BNK_NoisyLatentImage"]().create_noisy_latents(self.source, seed, size[3] * 8, size[2] * 8, size[0])[0]
+            samples = mappings["BNK_InjectNoise"]().inject_noise(samples, strength, noise, mask)[0]
+        else:
+            # ComfyUI Noise only makes 4-channel noise (and silently skips other shapes), so
+            # Flux, SD3, Qwen-Image and similar latents get noise of their own shape here.
+            samples = inject_noise(samples, strength, self.source, seed, mask)
 
         if mask is not None:
             samples['noise_mask'] = mask
@@ -192,7 +219,7 @@ class UnsamplerHook(PixelKSampleHook):
 
         Unsampler = noise_nodes.Unsampler
 
-        end_at_step = self.start_end_at_step + (self.end_end_at_step - self.start_end_at_step) * cur_step / self.total_step
+        end_at_step = self.start_end_at_step + (self.end_end_at_step - self.start_end_at_step) * schedule_progress(cur_step, self.total_step)
         end_at_step = int(end_at_step)
 
         logging.info(f"[Impact Pack] UnsamplerHook: end_at_step = {end_at_step}")

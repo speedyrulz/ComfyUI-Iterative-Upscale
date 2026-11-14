@@ -30,7 +30,8 @@ def calculate_sigmas(model, sampler, scheduler, steps):
     elif scheduler.startswith('GITS[coeff='):
         sigmas = nodes.NODE_CLASS_MAPPINGS['GITSScheduler']().execute(float(scheduler[11:-1]), steps, denoise=1.0)[0]
     elif scheduler == 'LTXV[default]':
-        sigmas = nodes.NODE_CLASS_MAPPINGS['LTXVScheduler']().execute(20, 2.05, 0.95, True, 0.1)[0]
+        # LTXVScheduler's default shift/stretch/terminal, with the requested number of steps
+        sigmas = nodes.NODE_CLASS_MAPPINGS['LTXVScheduler']().execute(steps, 2.05, 0.95, True, 0.1)[0]
     elif scheduler.startswith('OSS'):
         sigmas = nodes.NODE_CLASS_MAPPINGS['OptimalStepsScheduler']().execute(scheduler[4:], steps, denoise=1.0)[0]
     else:
@@ -188,6 +189,10 @@ def separated_sample(model, add_noise, seed, steps, cfg, sampler_name, scheduler
 
 
 def impact_sample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise=1.0, sigma_ratio=1.0, sampler_opt=None, noise=None, scheduler_func=None):
+    if denoise <= 0.0:
+        # Nothing to denoise; same as ComfyUI's KSampler (an empty sigma schedule).
+        return latent_image
+
     advanced_steps = math.floor(steps / denoise)
     start_at_step = advanced_steps - steps
     end_at_step = start_at_step + steps
@@ -206,7 +211,7 @@ class KSamplerWrapper:
         model, seed, steps, cfg, sampler_name, scheduler, positive, negative, denoise = self.params
 
         if hook is not None:
-            model, seed, steps, cfg, sampler_name, scheduler, positive, negative, upscaled_latent, denoise = \
+            model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise = \
                 hook.pre_ksample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise)
 
         return impact_sample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise, scheduler_func=self.scheduler_func)

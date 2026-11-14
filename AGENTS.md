@@ -16,6 +16,15 @@
 - The progress event is `rulz-iterative-upscale/update_status` and the menu
   category root is `RulZ/`; do not switch either back to Impact Pack's names.
 
+# Tests
+
+- `python -m pytest tests` runs offline on plain Python with torch: `tests/conftest.py`
+  stubs the ComfyUI modules and loads the pack. No ComfyUI install or GPU is needed.
+- `tests/test_widgets.py` pins every node ID and the names and order of its inputs.
+  Update it only together with a deliberate, documented compatibility change.
+- Behaviour that depends on ComfyUI internals still needs a check against a real
+  ComfyUI install.
+
 # Scope
 
 - This pack holds only the Iterative Upscale nodes from ComfyUI Impact Pack and

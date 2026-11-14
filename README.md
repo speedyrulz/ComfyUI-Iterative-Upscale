@@ -29,7 +29,9 @@ Optional node packs, only for the nodes that name them:
 
 * [BlenderNeko/ComfyUI_TiledKSampler](https://github.com/BlenderNeko/ComfyUI_TiledKSampler) for
   `PixelTiledKSampleUpscalerProvider`, `PixelTiledKSampleUpscalerProviderPipe` and `TiledKSamplerProvider`.
-* [BlenderNeko/ComfyUI_Noise](https://github.com/BlenderNeko/ComfyUI_Noise) for `NoiseInjectionHookProvider`.
+* [BlenderNeko/ComfyUI_Noise](https://github.com/BlenderNeko/ComfyUI_Noise), optional for `NoiseInjectionHookProvider`:
+  when installed it makes the noise for 4-channel latents (SD1.5, SDXL), so results match Impact Pack.
+  Without it, and for other latents (Flux, SD3, Qwen-Image, ...), the hook makes its own seeded noise.
 * [Fannovel16/comfyui_controlnet_aux](https://github.com/Fannovel16/comfyui_controlnet_aux) (`TilePreprocessor`)
   when a tile ControlNet is connected to `tile_cnet_opt`.
 
@@ -65,7 +67,7 @@ Optional node packs, only for the nodes that name them:
 * `CfgScheduleHookProvider` - Moves cfg towards `target_cfg` as the steps progress.
 * `StepsScheduleHookProvider` - Moves the sampling steps towards `target_steps` as the steps progress.
 * `NoiseInjectionHookProvider` - Injects noise into the latent at each step, from `start_strength`
-  to `end_strength`. Needs ComfyUI_Noise.
+  on the first step to `end_strength` on the last. Works with any latent type.
 * `UnsamplerHookProvider` - Applies the Unsampler at each step (bundled, no extra pack needed).
 * `PixelKSampleHookCombine` - Chains two PK_HOOKs; hook1 runs first, then hook2.
 

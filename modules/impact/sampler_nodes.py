@@ -92,7 +92,9 @@ class GITSSchedulerFuncProvider:
             if 'GITSScheduler' not in nodes.NODE_CLASS_MAPPINGS:
                 raise Exception("[Impact Pack] ComfyUI is an outdated version. Cannot use GITSScheduler.")
 
-            scheduler = nodes.NODE_CLASS_MAPPINGS['GITSScheduler']()
-            return scheduler.get_sigmas(coeff, steps, denoise)[0]
+            scheduler = nodes.NODE_CLASS_MAPPINGS['GITSScheduler']
+            if hasattr(scheduler, 'execute'):  # V3 node (current ComfyUI)
+                return scheduler.execute(coeff, steps, denoise)[0]
+            return scheduler().get_sigmas(coeff, steps, denoise)[0]
 
         return (f, )

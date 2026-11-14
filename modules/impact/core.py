@@ -21,7 +21,16 @@ def get_schedulers():
     return list(comfy.samplers.SCHEDULER_HANDLERS) + ADDITIONAL_SCHEDULERS
 
 
+def clamp_overlap(tile_size, overlap):
+    # Same rule as VAEDecodeTiled. VAEEncodeTiled has no such check, and ComfyUI's tiled
+    # encoder also uses tile_size // 2 tiles, so overlap >= tile_size / 2 divides by zero.
+    if tile_size < overlap * 4:
+        overlap = tile_size // 4
+    return overlap
+
+
 def vae_decode(vae, samples, use_tile, hook, tile_size=512, overlap=64):
+    overlap = clamp_overlap(tile_size, overlap)
     if use_tile:
         decoder = nodes.VAEDecodeTiled()
         if 'overlap' in inspect.signature(decoder.decode).parameters:
@@ -39,6 +48,7 @@ def vae_decode(vae, samples, use_tile, hook, tile_size=512, overlap=64):
 
 
 def vae_encode(vae, pixels, use_tile, hook, tile_size=512, overlap=64):
+    overlap = clamp_overlap(tile_size, overlap)
     if use_tile:
         encoder = nodes.VAEEncodeTiled()
         if 'overlap' in inspect.signature(encoder.encode).parameters:
@@ -212,7 +222,7 @@ class TwoSamplersForMaskUpscaler:
                                                                        upscale_factor, vae,
                                                                        use_tile=self.use_tiled_vae,
                                                                        save_temp_prefix=save_temp_prefix,
-                                                                       hook=self.hook_mask, tile_size=self.tile_size)
+                                                                       hook=self.hook_base, tile_size=self.tile_size)
 
         return self.do_samples(step_info, base_sampler, mask_sampler, sample_schedule, mask, upscaled_latent)
 
@@ -243,7 +253,7 @@ class TwoSamplersForMaskUpscaler:
                                                                              w, h, vae,
                                                                              use_tile=self.use_tiled_vae,
                                                                              save_temp_prefix=save_temp_prefix,
-                                                                             hook=self.hook_mask,
+                                                                             hook=self.hook_base,
                                                                              tile_size=self.tile_size)
 
         return self.do_samples(step_info, base_sampler, mask_sampler, sample_schedule, mask, upscaled_latent)
@@ -251,9 +261,9 @@ class TwoSamplersForMaskUpscaler:
     def is_full_sample_time(self, step_info, sample_schedule):
         cur_step, total_step = step_info
 
-        # make start from 1 instead of zero
+        # step_info is (zero-based step index, number of steps): count steps from 1.
         cur_step += 1
-        total_step += 1
+        is_last = cur_step >= total_step
 
         if sample_schedule == "none":
             return False
@@ -268,19 +278,21 @@ class TwoSamplersForMaskUpscaler:
             return cur_step % 4 == 0
 
         elif sample_schedule == "last1":
-            return cur_step == total_step
+            return is_last
 
         elif sample_schedule == "last2":
             return cur_step >= total_step - 1
 
         elif sample_schedule == "interleave1+last1":
-            return cur_step % 2 == 0 or cur_step >= total_step - 1
+            return cur_step % 2 == 0 or is_last
 
         elif sample_schedule == "interleave2+last1":
-            return cur_step % 2 == 0 or cur_step >= total_step - 1
+            return cur_step % 3 == 0 or is_last
 
         elif sample_schedule == "interleave3+last1":
-            return cur_step % 2 == 0 or cur_step >= total_step - 1
+            return cur_step % 4 == 0 or is_last
+
+        return False
 
     def do_samples(self, step_info, base_sampler, mask_sampler, sample_schedule, mask, upscaled_latent):
         mask = utils.make_2d_mask(mask)
@@ -294,9 +306,11 @@ class TwoSamplersForMaskUpscaler:
 
         else:
             logging.info(f"step_info={step_info} / non-full time")
-            # upscale mask
+            # upscale mask: F.interpolate needs [B, C, H, W]
             if mask.ndim == 2:
-                mask = mask[None, :, :, None]
+                mask = mask[None, None, :, :]
+            elif mask.ndim == 3:
+                mask = mask[:, None, :, :]
             upscaled_mask = F.interpolate(mask, size=(upscaled_latent['samples'].shape[2], upscaled_latent['samples'].shape[3]), mode='bilinear', align_corners=True)
             upscaled_mask = upscaled_mask[:, :, :upscaled_latent['samples'].shape[2], :upscaled_latent['samples'].shape[3]]
 
@@ -364,7 +378,7 @@ class PixelKSampleUpscaler:
             upscaled_latent, upscaled_images = \
                 latent_upscale_on_pixel_space2(samples, scale_method, upscale_factor, vae,
                                                use_tile=self.use_tiled_vae,
-                                               save_temp_prefix=save_temp_prefix, hook=self.hook, tile_size=512)
+                                               save_temp_prefix=save_temp_prefix, hook=self.hook, tile_size=self.tile_size)
         else:
             upscaled_latent, upscaled_images = \
                 latent_upscale_on_pixel_space_with_model2(samples, scale_method, self.upscale_model,
@@ -437,7 +451,7 @@ class TiledKSamplerWrapper:
         model, seed, steps, cfg, sampler_name, scheduler, positive, negative, denoise, tile_width, tile_height, tiling_strategy = self.params
 
         if hook is not None:
-            model, seed, steps, cfg, sampler_name, scheduler, positive, negative, upscaled_latent, denoise = \
+            model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise = \
                 hook.pre_ksample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image,
                                  denoise)
 
@@ -472,6 +486,12 @@ class PixelTiledKSampleUpscaler:
         scale_method, model, vae, seed, steps, cfg, sampler_name, scheduler, positive, negative, denoise = self.params
         tile_width, tile_height, tiling_strategy = self.tile_params
 
+        # PK_HOOK schedules (cfg, denoise, steps) apply here as in PixelKSampleUpscaler.
+        if self.hook is not None:
+            model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise = \
+                self.hook.pre_ksample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative,
+                                      latent, denoise)
+
         if self.tile_cnet is not None:
             image_batch, image_w, image_h, _ = images.shape
             if image_batch > 1:
@@ -504,13 +524,16 @@ class PixelTiledKSampleUpscaler:
             upscaled_latent, upscaled_images = \
                 latent_upscale_on_pixel_space2(samples, scale_method, upscale_factor, vae,
                                                use_tile=True, save_temp_prefix=save_temp_prefix,
-                                               hook=self.hook, tile_size=self.tile_size)
+                                               hook=self.hook, tile_size=self.tile_size, overlap=self.overlap)
         else:
             upscaled_latent, upscaled_images = \
                 latent_upscale_on_pixel_space_with_model2(samples, scale_method, self.upscale_model,
                                                           upscale_factor, vae, use_tile=True,
                                                           save_temp_prefix=save_temp_prefix,
-                                                          hook=self.hook, tile_size=self.tile_size)
+                                                          hook=self.hook, tile_size=self.tile_size, overlap=self.overlap)
+
+        if 'noise_mask' in samples:
+            upscaled_latent['noise_mask'] = samples['noise_mask']
 
         refined_latent = self.tiled_ksample(upscaled_latent, upscaled_images)
 
@@ -526,7 +549,7 @@ class PixelTiledKSampleUpscaler:
             upscaled_latent, upscaled_images = \
                 latent_upscale_on_pixel_space_shape2(samples, scale_method, w, h, vae,
                                                      use_tile=True, save_temp_prefix=save_temp_prefix,
-                                                     hook=self.hook, tile_size=self.tile_size)
+                                                     hook=self.hook, tile_size=self.tile_size, overlap=self.overlap)
         else:
             upscaled_latent, upscaled_images = \
                 latent_upscale_on_pixel_space_with_model_shape2(samples, scale_method,
@@ -534,7 +557,10 @@ class PixelTiledKSampleUpscaler:
                                                                 use_tile=True,
                                                                 save_temp_prefix=save_temp_prefix,
                                                                 hook=self.hook,
-                                                                tile_size=self.tile_size)
+                                                                tile_size=self.tile_size, overlap=self.overlap)
+
+        if 'noise_mask' in samples:
+            upscaled_latent['noise_mask'] = samples['noise_mask']
 
         refined_latent = self.tiled_ksample(upscaled_latent, upscaled_images)
 
