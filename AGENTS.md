@@ -9,26 +9,16 @@
   incoming merges for the same compatibility requirement.
 - Relevant regression tests must check widget names, order, and saved values
   before and after loading a native workflow.
+- Node IDs (the keys of `NODE_CLASS_MAPPINGS`) must not change either; they are
+  what saved workflows refer to. Every ID is the Impact Pack ID with a `RulZ`
+  prefix (display names: `RulZ ` plus the Impact Pack name), so the pack can be
+  installed next to Impact Pack. New nodes follow the same pattern.
+- The progress event is `rulz-iterative-upscale/update_status` and the menu
+  category root is `RulZ/`; do not switch either back to Impact Pack's names.
 
-# Adding nodes to the validation catalog
+# Scope
 
-- Before starting a node addition, run `tests/test_e2e_widget_catalog.py` with
-  pytest against the existing trusted workflow and snapshot. Both positional
-  and named restoration must pass before changing either fixture.
-- Treat `tests/workflows/all-impact-nodes.widgets.json` as the fixed reference.
-  A workflow loaded by modified or broken code is not a new source of truth.
-  If existing checks fail, fix the code first; never regenerate, delete, or
-  relax the snapshot to make them pass. Restore missing fixtures from a trusted
-  revision instead of rebuilding them from the current runtime.
-- Every new registered node type, including aliases and nodes without widgets,
-  must be added exactly once to `tests/workflows/all-impact-nodes.json` in the
-  same change as the node implementation.
-- Extend the existing workflow through Chrome E2E node search and native Export.
-  Do not construct or edit its JSON by hand or create nodes through graph APIs.
-  Preserve existing nodes and snapshot records; append the new node's rendered
-  widget name/value pairs in order, or an empty list when it has no widgets.
-- The recorder must verify existing nodes against the unchanged snapshot before
-  adding nodes, then verify the complete candidate in both restoration modes
-  before replacing either fixture. Run the full catalog E2E after the update.
-  See `docs/E2E_TEST_STRATEGY.md` for commands. This covers loading and widget
-  compatibility; add behavior tests appropriate to the new node separately.
+- This pack holds only the Iterative Upscale nodes from ComfyUI Impact Pack and
+  the nodes needed to feed them (UPSCALER providers, PK_HOOK providers, KSAMPLER
+  providers, the GITS scheduler function and the BASIC_PIPE nodes).
+- Keep it free of extra Python dependencies beyond ComfyUI itself.
