@@ -192,8 +192,12 @@ class InjectNoiseHook(PixelKSampleHook):
         if len(size) == 4 and size[1] == 4 and "BNK_NoisyLatentImage" in mappings and "BNK_InjectNoise" in mappings:
             # 4-channel latents keep using ComfyUI Noise's noise (the same noise as Impact Pack).
             noise = mappings["BNK_NoisyLatentImage"]().create_noisy_latents(self.source, seed, size[3] * 8, size[2] * 8, size[0])[0]
-            # ComfyUI Noise only expands the mask's channels, so give it a latent-sized mask.
-            bnk_mask = None if mask is None else comfy.utils.reshape_mask(mask, size).to(samples['samples'].device)
+            # ComfyUI Noise's prepare_mask reshapes the mask to (-1, 1, H, W) and resizes it, and only
+            # repeats a batch that is too small: give it one channel and exactly the latent's batch.
+            bnk_mask = None
+            if mask is not None:
+                bnk_mask = comfy.utils.reshape_mask(mask, (size[0], 1, size[2], size[3]))[:size[0]]
+                bnk_mask = bnk_mask.to(samples['samples'].device)
             samples = mappings["BNK_InjectNoise"]().inject_noise(samples, strength, noise, bnk_mask)[0]
         else:
             # ComfyUI Noise only makes 4-channel noise (and silently skips other shapes), so

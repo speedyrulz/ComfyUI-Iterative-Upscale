@@ -435,8 +435,7 @@ def test_image_upscale_accepts_upscaler_without_tile_size(impact, monkeypatch):
     monkeypatch.setattr(nodes, "VAEDecode", type("VAEDecode", (), {"decode": lambda self, vae, s: (torch.zeros(1, 8, 8, 3),)}))
     monkeypatch.setattr(impact.upscale_nodes.IterativeLatentUpscale, "doit", lambda self, lat, *a: (lat, None))
 
-    class ForeignUpscaler:
-        is_tiled = False
+    class ForeignUpscaler:  # no is_tiled, tile_size or overlap
         vae = "vae"
 
     out = impact.upscale_nodes.IterativeImageUpscale().doit(torch.zeros(1, 64, 64, 3), 2.0, 2, "", ForeignUpscaler(), "vae")
@@ -563,28 +562,40 @@ def test_inject_noise_falls_back_to_cpu_generator(impact, monkeypatch):
     assert torch.equal(out["samples"], ref["samples"])
 
 
-def test_comfyui_noise_gets_latent_sized_mask(impact, node_mappings):
-    got = []
+def _bnk_prepare_mask(mask, shape):
+    # Copied from ComfyUI_Noise nodes.py (prepare_mask), so the fake behaves like the real node.
+    mask = torch.nn.functional.interpolate(mask.reshape((-1, 1, mask.shape[-2], mask.shape[-1])), size=(shape[2], shape[3]), mode="bilinear")
+    mask = mask.expand((-1, shape[1], -1, -1))
+    if mask.shape[0] < shape[0]:
+        mask = mask.repeat((shape[0] - 1) // mask.shape[0] + 1, 1, 1, 1)[:shape[0]]
+    return mask
 
+
+@pytest.mark.parametrize("batch", [1, 2])
+def test_comfyui_noise_path_respects_mask_and_batch(impact, node_mappings, batch):
     class BNK_NoisyLatentImage:
         def create_noisy_latents(self, source, seed, width, height, batch_size):
             return ({"samples": torch.ones(batch_size, 4, height // 8, width // 8)},)
 
     class BNK_InjectNoise:
+        # Same logic as ComfyUI_Noise's InjectNoise.inject_noise.
         def inject_noise(self, latents, strength, noise=None, mask=None):
-            # ComfyUI_Noise's prepare_mask: expand channels only, no resize
-            mask = mask.expand((-1, latents["samples"].shape[1], -1, -1))
-            got.append(mask.shape)
             s = latents.copy()
-            s["samples"] = mask * (latents["samples"] + noise["samples"] * strength) + (1 - mask) * latents["samples"]
+            if latents["samples"].shape != noise["samples"].shape:
+                return (s,)
+            noised = s["samples"].clone() + noise["samples"].clone() * strength
+            if mask is not None:
+                mask = _bnk_prepare_mask(mask, noised.shape)
+                noised = mask * noised + (1 - mask) * latents["samples"]
+            s["samples"] = noised
             return (s,)
 
     node_mappings.update(BNK_NoisyLatentImage=BNK_NoisyLatentImage, BNK_InjectNoise=BNK_InjectNoise)
     hook = impact.hooks.InjectNoiseHook("CPU", 1, 1.0, 1.0)
     hook.set_steps((0, 1))
-    mask = torch.zeros(1, 32, 32)  # mask at a different resolution than the latent
+    mask = torch.zeros(1, 32, 32)  # one mask, at a different resolution than the latent
     mask[:, :, :16] = 1.0
-    out = hook.post_encode({"samples": torch.zeros(1, 4, 8, 8), "noise_mask": mask})
-    assert got == [torch.Size([1, 4, 8, 8])]
-    assert torch.all(out["samples"][..., :4] == 1) and torch.all(out["samples"][..., 4:] == 0)
+    out = hook.post_encode({"samples": torch.zeros(batch, 4, 8, 8), "noise_mask": mask})
+    assert out["samples"].shape == (batch, 4, 8, 8)  # batch must not grow
+    assert torch.all(out["samples"][..., :3] == 1) and torch.all(out["samples"][..., 5:] == 0)
     assert out["noise_mask"] is mask

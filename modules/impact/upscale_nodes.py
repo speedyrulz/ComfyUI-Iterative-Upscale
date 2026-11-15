@@ -487,7 +487,8 @@ class IterativeLatentUpscale:
 
     # dim_reduction_factor=8 for SD1/SDXL, used to calculate actual dims from latents based on VAE
     def doit(self, samples, upscale_factor, steps, temp_prefix, upscaler, step_mode="simple", vae_compression=8, unique_id=None):
-        if vae_compression <= 0:
+        auto_compression = vae_compression <= 0
+        if auto_compression:
             # 0 (the widget minimum) used to make every target size 0x0, which ImageScale
             # ignores, so nothing was upscaled. Read the factor from the VAE instead.
             vae_compression = vae_spatial_compression(getattr(upscaler, 'vae', None))
@@ -499,7 +500,7 @@ class IterativeLatentUpscale:
         # at every step; scaling straight to a multiple keeps the whole image. Use the VAE's
         # real factor when it reports one (the widget may be left at 8 for a 16x VAE).
         multiple = vae_spatial_compression(getattr(upscaler, 'vae', None), default=vae_compression, encode=True)
-        if multiple != vae_compression:
+        if multiple != vae_compression and not auto_compression:
             logging.warning(f"IterativeLatentUpscale: vae_compression is {vae_compression} but the VAE's factor is "
                             f"{multiple}, so the target sizes are off by {multiple / vae_compression:g}x. "
                             "Set vae_compression to 0 to use the VAE's factor.")
@@ -576,7 +577,7 @@ class IterativeImageUpscale:
 
         # Tiled VAE for the first encode and final decode whenever the upscaler uses it per step
         # (the tiled sampler always does; the other upscalers when use_tiled_vae is on).
-        use_tile = upscaler.is_tiled or getattr(upscaler, 'use_tiled_vae', False)
+        use_tile = getattr(upscaler, 'is_tiled', False) or getattr(upscaler, 'use_tiled_vae', False)
         overlap = getattr(upscaler, 'overlap', 64)
 
         try:
