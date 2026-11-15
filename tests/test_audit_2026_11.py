@@ -397,9 +397,9 @@ def test_iterative_latent_upscale_sizes_are_vae_multiples(impact, status):
     assert all(w % 8 == 0 and h % 8 == 0 for w, h in sizes)
 
 
-# ---------------------------------------------------------------- B20: overlap too large for the tile is clamped
+# ---------------------------------------------------------------- B20: encode overlap that would crash is clamped
 
-def test_tiled_vae_overlap_clamped_to_quarter_tile(impact, monkeypatch):
+def test_tiled_encode_overlap_clamped_only_when_it_would_crash(impact, monkeypatch):
     nodes = sys.modules["nodes"]
     seen = []
 
@@ -415,17 +415,46 @@ def test_tiled_vae_overlap_clamped_to_quarter_tile(impact, monkeypatch):
 
     monkeypatch.setattr(nodes, "VAEEncodeTiled", VAEEncodeTiled)
     monkeypatch.setattr(nodes, "VAEDecodeTiled", VAEDecodeTiled)
-    impact.core.vae_encode("vae", torch.zeros(1, 64, 64, 3), True, None, tile_size=512, overlap=256)
-    impact.core.vae_decode("vae", latent(), True, None, tile_size=512, overlap=256)
-    impact.core.vae_encode("vae", torch.zeros(1, 64, 64, 3), True, None, tile_size=512, overlap=64)
-    assert seen == [("encode", 512, 128), ("decode", 512, 128), ("encode", 512, 64)]
+    impact.core.vae_encode("vae", torch.zeros(1, 64, 64, 3), True, None, tile_size=512, overlap=256)  # would divide by 0
+    impact.core.vae_encode("vae", torch.zeros(1, 64, 64, 3), True, None, tile_size=512, overlap=160)  # worked: kept
+    impact.core.vae_decode("vae", latent(), True, None, tile_size=512, overlap=256)  # VAEDecodeTiled clamps itself
+    assert seen == [("encode", 512, 128), ("encode", 512, 160), ("decode", 512, 256)]
 
     monkeypatch.setattr(impact.upscale_nodes.IterativeLatentUpscale, "doit", lambda self, lat, *a: (lat, None))
     upscaler = impact.core.PixelTiledKSampleUpscaler("bilinear", "m", "vae", 0, 20, 7.0, "euler", "normal",
                                                      [], [], 0.5, 512, 512, "random", tile_size=512, overlap=1024)
     seen.clear()
     impact.upscale_nodes.IterativeImageUpscale().doit(torch.zeros(1, 64, 64, 3), 2.0, 2, "", upscaler, "vae")
-    assert seen == [("encode", 512, 128), ("decode", 512, 128)]
+    assert seen == [("encode", 512, 128), ("decode", 512, 1024)]
+
+
+def test_image_upscale_accepts_upscaler_without_tile_size(impact, monkeypatch):
+    # An UPSCALER from another pack may lack tile_size/overlap; untiled runs must not need them.
+    nodes = sys.modules["nodes"]
+    monkeypatch.setattr(nodes, "VAEEncode", type("VAEEncode", (), {"encode": lambda self, vae, px: (latent(),)}))
+    monkeypatch.setattr(nodes, "VAEDecode", type("VAEDecode", (), {"decode": lambda self, vae, s: (torch.zeros(1, 8, 8, 3),)}))
+    monkeypatch.setattr(impact.upscale_nodes.IterativeLatentUpscale, "doit", lambda self, lat, *a: (lat, None))
+
+    class ForeignUpscaler:
+        is_tiled = False
+        vae = "vae"
+
+    out = impact.upscale_nodes.IterativeImageUpscale().doit(torch.zeros(1, 64, 64, 3), 2.0, 2, "", ForeignUpscaler(), "vae")
+    assert out[0].shape == (1, 8, 8, 3)
+
+
+def test_image_upscale_clears_status_on_error(impact, status, monkeypatch):
+    nodes = sys.modules["nodes"]
+
+    class VAEEncode:
+        def encode(self, vae, pixels):
+            raise RuntimeError("out of memory")
+
+    monkeypatch.setattr(nodes, "VAEEncode", VAEEncode)
+    upscaler = impact.core.PixelKSampleUpscaler("bilinear", "m", "vae", 0, 20, 7.0, "euler", "normal", [], [], 0.5, False)
+    with pytest.raises(RuntimeError):
+        impact.upscale_nodes.IterativeImageUpscale().doit(torch.zeros(1, 64, 64, 3), 2.0, 2, "", upscaler, "vae", unique_id="3")
+    assert status[-1][1]["text"] == ""
 
 
 # ---------------------------------------------------------------- B21: vae_compression 0 reads the VAE's factor
@@ -446,3 +475,116 @@ def test_vae_compression_zero_uses_vae_factor(impact, status):
 
     impact.upscale_nodes.IterativeLatentUpscale().doit(latent(h=4, w=4), 2.0, 1, "", SizeUpscaler(), vae_compression=0)
     assert sizes == [(128, 128)]
+
+
+# ---------------------------------------------------------------- B22: post_encode hooks see the latent's noise_mask
+
+def test_noise_hook_respects_noise_mask_inside_upscaler(impact, monkeypatch):
+    nodes = sys.modules["nodes"]
+
+    class VAEDecode:
+        def decode(self, vae, samples):
+            s = samples["samples"]
+            return (torch.zeros(s.shape[0], s.shape[2] * 8, s.shape[3] * 8, 3),)
+
+    class ImageScale:
+        def upscale(self, image, method, w, h, crop):
+            return (torch.zeros(image.shape[0], h, w, 3),)
+
+    class VAEEncode:
+        def encode(self, vae, pixels):
+            return ({"samples": torch.zeros(pixels.shape[0], 16, pixels.shape[1] // 8, pixels.shape[2] // 8)},)
+
+    monkeypatch.setattr(nodes, "VAEDecode", VAEDecode)
+    monkeypatch.setattr(nodes, "ImageScale", ImageScale)
+    monkeypatch.setattr(nodes, "VAEEncode", VAEEncode)
+    sampled = []
+    monkeypatch.setattr(impact.impact_sampling, "impact_sample", lambda *a, **k: sampled.append(a[8]) or a[8])
+
+    hook = impact.hooks.InjectNoiseHook("CPU", 3, 1.0, 1.0)
+    upscaler = impact.core.PixelKSampleUpscaler("bilinear", "m", "vae", 0, 20, 7.0, "euler", "normal", [], [], 0.5,
+                                                False, hook_opt=hook)
+    mask = torch.zeros(1, 8, 8)
+    mask[:, :, :4] = 1.0  # only the left half may change
+    upscaler.upscale_shape((0, 2), {"samples": torch.zeros(1, 16, 8, 8), "noise_mask": mask}, 128, 128)
+
+    out = sampled[0]["samples"]
+    assert out[..., :7].abs().mean() > 0.5
+    assert torch.all(out[..., 9:] == 0)  # column 8 is the bilinear edge of the upscaled mask
+    assert sampled[0]["noise_mask"] is mask
+
+
+def test_vae_encode_does_not_add_noise_mask_to_its_result(impact, monkeypatch):
+    # TwoSamplersForMask sets its own masks; the helper must not leak the input mask into its latent.
+    nodes = sys.modules["nodes"]
+
+    class VAEEncode:
+        def encode(self, vae, pixels):
+            return ({"samples": torch.zeros(1, 4, 8, 8)},)
+
+    monkeypatch.setattr(nodes, "VAEEncode", VAEEncode)
+    out = impact.core.vae_encode("vae", torch.zeros(1, 64, 64, 3), False, impact.hooks.PixelKSampleHook(),
+                                 noise_mask=torch.ones(1, 8, 8))
+    assert "noise_mask" not in out
+
+
+# ---------------------------------------------------------------- B23: sizes snap to the VAE's real factor
+
+def test_step_sizes_snap_to_real_vae_factor(impact, status):
+    sizes = []
+
+    class VAE16:
+        def spacial_compression_encode(self):
+            return 16
+
+        def spacial_compression_decode(self):
+            return 16
+
+    class SizeUpscaler:
+        vae = VAE16()
+
+        def upscale_shape(self, step_info, samples, w, h, prefix=None):
+            sizes.append((w, h))
+            return dict(samples)
+
+    # widget left at 8 for a 16x VAE: sizes must still be multiples of 16 or the VAE crops them
+    impact.upscale_nodes.IterativeLatentUpscale().doit(latent(h=9, w=9), 1.3, 2, "", SizeUpscaler(), vae_compression=8)
+    assert all(w % 16 == 0 and h % 16 == 0 for w, h in sizes), sizes
+
+
+# ---------------------------------------------------------------- B24: GPU noise falls back when the device has no generator
+
+def test_inject_noise_falls_back_to_cpu_generator(impact, monkeypatch):
+    mm = sys.modules["comfy.model_management"]
+    monkeypatch.setattr(mm, "get_torch_device", lambda: torch.device("meta"))  # torch.Generator(device="meta") raises
+    out = impact.hooks.inject_noise({"samples": torch.zeros(1, 16, 4, 4)}, 1.0, "GPU", 7)
+    ref = impact.hooks.inject_noise({"samples": torch.zeros(1, 16, 4, 4)}, 1.0, "CPU", 7)
+    assert out["samples"].device.type == "cpu"
+    assert torch.equal(out["samples"], ref["samples"])
+
+
+def test_comfyui_noise_gets_latent_sized_mask(impact, node_mappings):
+    got = []
+
+    class BNK_NoisyLatentImage:
+        def create_noisy_latents(self, source, seed, width, height, batch_size):
+            return ({"samples": torch.ones(batch_size, 4, height // 8, width // 8)},)
+
+    class BNK_InjectNoise:
+        def inject_noise(self, latents, strength, noise=None, mask=None):
+            # ComfyUI_Noise's prepare_mask: expand channels only, no resize
+            mask = mask.expand((-1, latents["samples"].shape[1], -1, -1))
+            got.append(mask.shape)
+            s = latents.copy()
+            s["samples"] = mask * (latents["samples"] + noise["samples"] * strength) + (1 - mask) * latents["samples"]
+            return (s,)
+
+    node_mappings.update(BNK_NoisyLatentImage=BNK_NoisyLatentImage, BNK_InjectNoise=BNK_InjectNoise)
+    hook = impact.hooks.InjectNoiseHook("CPU", 1, 1.0, 1.0)
+    hook.set_steps((0, 1))
+    mask = torch.zeros(1, 32, 32)  # mask at a different resolution than the latent
+    mask[:, :, :16] = 1.0
+    out = hook.post_encode({"samples": torch.zeros(1, 4, 8, 8), "noise_mask": mask})
+    assert got == [torch.Size([1, 4, 8, 8])]
+    assert torch.all(out["samples"][..., :4] == 1) and torch.all(out["samples"][..., 4:] == 0)
+    assert out["noise_mask"] is mask

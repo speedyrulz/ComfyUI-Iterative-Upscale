@@ -30,7 +30,7 @@ Optional node packs, only for the nodes that name them:
 * [BlenderNeko/ComfyUI_TiledKSampler](https://github.com/BlenderNeko/ComfyUI_TiledKSampler) for
   `PixelTiledKSampleUpscalerProvider`, `PixelTiledKSampleUpscalerProviderPipe` and `TiledKSamplerProvider`.
 * [BlenderNeko/ComfyUI_Noise](https://github.com/BlenderNeko/ComfyUI_Noise), optional for `NoiseInjectionHookProvider`:
-  when installed it makes the noise for 4-channel latents (SD1.5, SDXL), so results match Impact Pack.
+  when installed it makes the noise for 4-channel latents (SD1.5, SDXL), the same noise Impact Pack uses.
   Without it, and for other latents (Flux, SD3, Qwen-Image, ...), the hook makes its own seeded noise.
 * [Fannovel16/comfyui_controlnet_aux](https://github.com/Fannovel16/comfyui_controlnet_aux) (`TilePreprocessor`)
   when a tile ControlNet is connected to `tile_cnet_opt`.
@@ -42,6 +42,7 @@ Optional node packs, only for the nodes that name them:
   step by step with the connected `UPSCALER`. Latent in, latent out.
   * `step_mode`: `simple` grows the scale by the same amount each step; `geometric` by the same ratio.
   * `vae_compression`: the VAE's spatial downscale factor (8 for SD1/SDXL), used to work out pixel sizes.
+    Set it to 0 to read the factor from the VAE. Step sizes are rounded down to multiples of the factor.
 * `Iterative Upscale (Image)` - The same, image in and image out. Internally it uses the latent node.
 
 ### Upscaler providers (`UPSCALER`)
@@ -77,6 +78,27 @@ Optional node packs, only for the nodes that name them:
 * `ToBasicPipe`, `FromBasicPipe`, `FromBasicPipe_v2` - Bundle model, clip, vae, positive and negative
   into a `BASIC_PIPE` for the pipe versions of the providers, or take them apart again.
 * `EditBasicPipe` - Replaces some elements of a `BASIC_PIPE` (for example the model or prompts).
+
+## Fixes compared with Impact Pack 8.30
+
+These change the output of some workflows that use the same settings:
+
+* `TwoSamplersForMask...`: a single mask now really selects the area for each sampler (before, the
+  samplers got the mask's first row). `full_sample_schedule`: `last1` now fires on the last step,
+  `last2` on the last two, and `interleave2/3+last1` on every 3rd/4th step plus the last.
+  With an upscale model connected, the base hook (not the mask hook) runs on the VAE steps.
+* `PixelTiledKSampleUpscalerProvider` (and `Pipe`): cfg, denoise and steps schedule hooks now take
+  effect, the latent's noise mask is used, and its `overlap` applies to every tiled VAE step.
+* `CfgScheduleHookProvider` keeps fractional cfg (it rounded down to whole numbers). Noise injection
+  and Unsampler schedules now reach their end value on the last step.
+* `NoiseInjectionHookProvider` works on non-4-channel latents (it silently did nothing there), and
+  noise injection and the Unsampler hook respect the latent's noise mask.
+* `GITSSchedulerFuncProvider` works on current ComfyUI (it crashed); the `LTXV[default]` scheduler
+  uses the requested steps (it always built 20, and could skip sampling entirely).
+* Iterative Upscale: `upscale_factor` 1 makes `steps` passes (one more than before); step sizes are
+  multiples of the VAE factor, so the image edges are no longer cropped at each step; the Image
+  version uses tiled VAE for its first and last step when the upscaler's `use_tiled_vae` is on.
+* denoise 0 (for example a denoise schedule down to 0) skips sampling instead of crashing.
 
 ## Tutorials (Impact Pack)
 

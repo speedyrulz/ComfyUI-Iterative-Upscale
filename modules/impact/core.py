@@ -21,16 +21,17 @@ def get_schedulers():
     return list(comfy.samplers.SCHEDULER_HANDLERS) + ADDITIONAL_SCHEDULERS
 
 
-def clamp_overlap(tile_size, overlap):
-    # Same rule as VAEDecodeTiled. VAEEncodeTiled has no such check, and ComfyUI's tiled
-    # encoder also uses tile_size // 2 tiles, so overlap >= tile_size / 2 divides by zero.
-    if tile_size < overlap * 4:
+def clamp_encode_overlap(tile_size, overlap):
+    # ComfyUI's tiled encoder also runs tile_size // 2 tiles with the same overlap, so an
+    # overlap >= tile_size // 2 divides by zero (or gives an empty, NaN latent). VAEEncodeTiled
+    # does not check this; clamp to a quarter tile, VAEDecodeTiled's own limit. Smaller
+    # values are left alone. (VAEDecodeTiled clamps the decode overlap itself.)
+    if overlap >= tile_size // 2:
         overlap = tile_size // 4
     return overlap
 
 
 def vae_decode(vae, samples, use_tile, hook, tile_size=512, overlap=64):
-    overlap = clamp_overlap(tile_size, overlap)
     if use_tile:
         decoder = nodes.VAEDecodeTiled()
         if 'overlap' in inspect.signature(decoder.decode).parameters:
@@ -47,8 +48,8 @@ def vae_decode(vae, samples, use_tile, hook, tile_size=512, overlap=64):
     return pixels
 
 
-def vae_encode(vae, pixels, use_tile, hook, tile_size=512, overlap=64):
-    overlap = clamp_overlap(tile_size, overlap)
+def vae_encode(vae, pixels, use_tile, hook, tile_size=512, overlap=64, noise_mask=None):
+    overlap = clamp_encode_overlap(tile_size, overlap)
     if use_tile:
         encoder = nodes.VAEEncodeTiled()
         if 'overlap' in inspect.signature(encoder.encode).parameters:
@@ -60,7 +61,15 @@ def vae_encode(vae, pixels, use_tile, hook, tile_size=512, overlap=64):
         samples = nodes.VAEEncode().encode(vae, pixels)[0]
 
     if hook is not None:
-        samples = hook.post_encode(samples)
+        if noise_mask is not None:
+            # post_encode hooks (noise injection, unsampler) must respect the latent's mask, or
+            # the area outside it keeps noise the masked sampling never removes. The caller
+            # decides whether the returned latent carries the mask.
+            samples['noise_mask'] = noise_mask
+            samples = hook.post_encode(samples)
+            samples.pop('noise_mask', None)
+        else:
+            samples = hook.post_encode(samples)
 
     return samples
 
@@ -81,7 +90,8 @@ def latent_upscale_on_pixel_space_shape2(samples, scale_method, w, h, vae, use_t
     if hook is not None:
         pixels = hook.post_upscale(pixels)
 
-    return vae_encode(vae, pixels, use_tile, hook, tile_size=tile_size, overlap=overlap), old_pixels
+    return vae_encode(vae, pixels, use_tile, hook, tile_size=tile_size, overlap=overlap,
+                      noise_mask=samples.get('noise_mask')), old_pixels
 
 
 def latent_upscale_on_pixel_space(samples, scale_method, scale_factor, vae, use_tile=False, tile_size=512, save_temp_prefix=None, hook=None, overlap=64):
@@ -102,7 +112,8 @@ def latent_upscale_on_pixel_space2(samples, scale_method, scale_factor, vae, use
     if hook is not None:
         pixels = hook.post_upscale(pixels)
 
-    return vae_encode(vae, pixels, use_tile, hook, tile_size=tile_size, overlap=overlap), old_pixels
+    return vae_encode(vae, pixels, use_tile, hook, tile_size=tile_size, overlap=overlap,
+                      noise_mask=samples.get('noise_mask')), old_pixels
 
 
 def latent_upscale_on_pixel_space_with_model_shape(samples, scale_method, upscale_model, new_w, new_h, vae, use_tile=False, tile_size=512, save_temp_prefix=None, hook=None, overlap=64):
@@ -138,7 +149,8 @@ def latent_upscale_on_pixel_space_with_model_shape2(samples, scale_method, upsca
     if hook is not None:
         pixels = hook.post_upscale(pixels)
 
-    return vae_encode(vae, pixels, use_tile, hook, tile_size=tile_size, overlap=overlap), old_pixels
+    return vae_encode(vae, pixels, use_tile, hook, tile_size=tile_size, overlap=overlap,
+                      noise_mask=samples.get('noise_mask')), old_pixels
 
 
 def latent_upscale_on_pixel_space_with_model(samples, scale_method, upscale_model, scale_factor, vae, use_tile=False,
@@ -180,7 +192,8 @@ def latent_upscale_on_pixel_space_with_model2(samples, scale_method, upscale_mod
     if hook is not None:
         pixels = hook.post_upscale(pixels)
 
-    return vae_encode(vae, pixels, use_tile, hook, tile_size=tile_size, overlap=overlap), old_pixels
+    return vae_encode(vae, pixels, use_tile, hook, tile_size=tile_size, overlap=overlap,
+                      noise_mask=samples.get('noise_mask')), old_pixels
 
 
 class TwoSamplersForMaskUpscaler:

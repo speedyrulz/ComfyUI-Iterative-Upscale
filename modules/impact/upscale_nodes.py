@@ -456,11 +456,12 @@ class TwoSamplersForMaskUpscalerProviderPipe:
         return (upscaler, )
 
 
-def vae_spatial_compression(vae, default=8):
+def vae_spatial_compression(vae, default=8, encode=False):
     try:
-        return int(vae.spacial_compression_decode())
+        factor = int(vae.spacial_compression_encode() if encode else vae.spacial_compression_decode())
     except Exception:
         return default
+    return factor if factor > 0 else default
 
 
 class IterativeLatentUpscale:
@@ -494,10 +495,17 @@ class IterativeLatentUpscale:
         h, w = samples['samples'].shape[-2:]
         w, h = w * vae_compression, h * vae_compression
 
+        # The VAE centre-crops pixels to multiples of its factor, cutting off the image edges
+        # at every step; scaling straight to a multiple keeps the whole image. Use the VAE's
+        # real factor when it reports one (the widget may be left at 8 for a 16x VAE).
+        multiple = vae_spatial_compression(getattr(upscaler, 'vae', None), default=vae_compression, encode=True)
+        if multiple != vae_compression:
+            logging.warning(f"IterativeLatentUpscale: vae_compression is {vae_compression} but the VAE's factor is "
+                            f"{multiple}, so the target sizes are off by {multiple / vae_compression:g}x. "
+                            "Set vae_compression to 0 to use the VAE's factor.")
+
         def snap(size):
-            # The VAE centre-crops pixels to multiples of its factor, cutting off the image
-            # edges at every step; scaling straight to a multiple keeps the whole image.
-            return max(vae_compression, int(size) // vae_compression * vae_compression)
+            return max(multiple, int(size) // multiple * multiple)
 
         if temp_prefix == "":
             temp_prefix = None
@@ -569,14 +577,15 @@ class IterativeImageUpscale:
         # Tiled VAE for the first encode and final decode whenever the upscaler uses it per step
         # (the tiled sampler always does; the other upscalers when use_tiled_vae is on).
         use_tile = upscaler.is_tiled or getattr(upscaler, 'use_tiled_vae', False)
-        overlap = core.clamp_overlap(upscaler.tile_size, getattr(upscaler, 'overlap', 64))
+        overlap = getattr(upscaler, 'overlap', 64)
 
         try:
             core.update_node_status(unique_id, "VAEEncode (first)", 0)
             if use_tile:
                 encoder = nodes.VAEEncodeTiled()
                 if 'overlap' in inspect.signature(encoder.encode).parameters:
-                    latent = encoder.encode(vae, pixels, upscaler.tile_size, overlap=overlap)[0]
+                    latent = encoder.encode(vae, pixels, upscaler.tile_size,
+                                            overlap=core.clamp_encode_overlap(upscaler.tile_size, overlap))[0]
                 else:
                     latent = encoder.encode(vae, pixels, upscaler.tile_size)[0]
             else:
